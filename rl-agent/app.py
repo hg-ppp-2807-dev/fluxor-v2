@@ -135,18 +135,18 @@ class DQNAgent:
 
         self.load_checkpoint()
 
-    def select_action(self, state: np.ndarray) -> int:
-        if random.random() < self.epsilon:
-            return random.randint(0, ACTION_DIM - 1)
+    def select_action(self, state: np.ndarray):
         with torch.no_grad():
             t = torch.FloatTensor(state).unsqueeze(0)
-            q = self.policy_net(t)
-            return int(q.argmax().item())
+            q = self.policy_net(t).squeeze()
+            q_values = q.tolist()
 
-    def q_values(self, state: np.ndarray) -> list:
-        with torch.no_grad():
-            t = torch.FloatTensor(state).unsqueeze(0)
-            return self.policy_net(t).squeeze().tolist()
+        if random.random() < self.epsilon:
+            action = random.randint(0, ACTION_DIM - 1)
+        else:
+            action = int(q.argmax().item())
+
+        return action, q_values
 
     def avg_recent_reward(self) -> float:
         """Average of last 100 rewards — responsive metric for dashboard."""
@@ -468,8 +468,7 @@ def decide():
 
     state = build_state(payload)
 
-    action = agent.select_action(state)
-    q_vals = agent.q_values(state)
+    action, q_vals = agent.select_action(state)
 
     log.info(
         f"[RL DECISION] "
