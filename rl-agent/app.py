@@ -21,6 +21,7 @@ import logging
 import threading
 import math
 from collections import deque
+from queue import Queue
 
 import numpy as np
 import torch
@@ -45,12 +46,17 @@ PROM_URL     = os.getenv("PROMETHEUS_URL", "http://prometheus:9090")
 CKPT_DIR     = os.getenv("CKPT_DIR", "./checkpoints")
 CKPT_PATH    = f"{CKPT_DIR}/dqn_latest.pt"
 SIM_ENABLED  = os.getenv("SIM_ENABLED", "true").lower() == "true"
-SIM_INTERVAL = float(os.getenv("SIM_INTERVAL_S", "0.1"))   # seconds between sim steps
+SIM_INTERVAL = float(os.getenv("SIM_INTERVAL_S", "0.1")) # seconds between sim steps
+TRAINING_ENABLED = os.getenv("TRAINING_ENABLED", "true").lower() == "true"
+TRAINING_QUEUE_SIZE = int(os.getenv("TRAINING_QUEUE_SIZE", "10000"))
+TRAINING_INTERVAL = float(os.getenv("TRAINING_INTERVAL_S", "0.0"))
+TRAINING_EVERY_N = int(os.getenv("TRAINING_EVERY_N", "8"))
 os.makedirs(CKPT_DIR, exist_ok=True)
 
 # ── Pending Decisions Storage ─────────────────────────────────
 pending_decisions = {}
 pending_decisions_lock = threading.Lock()
+training_queue = Queue(maxsize=TRAINING_QUEUE_SIZE)
 
 
 # ── DQN Model ─────────────────────────────────────────────────
@@ -148,12 +154,17 @@ class DQNAgent:
             return 0.0
         return float(np.mean(self.recent_rewards))
 
-    def store_and_train(self, state, action, reward, next_state):
+    def store_transition(self, state, action, reward, next_state):
         with self.lock:
             self.buffer.push(state, action, reward, next_state)
-            self.total_reward  += reward
+            self.total_reward += reward
             self.episode_steps += 1
             self.recent_rewards.append(reward)
+
+    def train_step(self):
+        with self.lock:
+            if not TRAINING_ENABLED:
+                return
 
             if len(self.buffer) < self.batch_size:
                 return
@@ -194,6 +205,10 @@ class DQNAgent:
                     f"loss={self.last_loss:.4f}  buffer={len(self.buffer)}"
                 )
 
+    def store_and_train(self, state, action, reward, next_state):
+        self.store_transition(state, action, reward, next_state)
+        self.train_step()
+
     def save_checkpoint(self):
         torch.save({
             "policy":     self.policy_net.state_dict(),
@@ -229,9 +244,6 @@ def build_state(payload: dict) -> np.ndarray:
         conn = float(active_conn[i]) if i < len(active_conn) else 0.0
         lat  = float(avg_lat[i])     if i < len(avg_lat)     else 100.0
 
-        prom_cpu = _prom_metric(f'backend_cpu_utilization{{server_id="{i+1}"}}')
-        if prom_cpu is not None:
-            cpu = prom_cpu
 
         state.append(np.clip(cpu  / 100.0,  0, 1))
         state.append(np.clip(conn / 100.0,  0, 1))
@@ -371,6 +383,56 @@ def _simulation_loop():
 # ── Create agent (after all class definitions) ────────────────
 agent = DQNAgent()
 
+def _training_loop():
+    log.info("[TRAINER] Background training worker started")
+
+    transitions_since_train = 0
+
+    while True:
+        try:
+            transition = training_queue.get()
+
+            if transition is None:
+                training_queue.task_done()
+                break
+
+            state, action, reward, next_state = transition
+
+            agent.store_transition(
+                state,
+                action,
+                reward,
+                next_state
+            )
+
+            transitions_since_train += 1
+
+            if (
+                TRAINING_ENABLED
+                and transitions_since_train >= TRAINING_EVERY_N
+            ):
+                agent.train_step()
+                transitions_since_train = 0
+
+            if TRAINING_INTERVAL > 0:
+                time.sleep(TRAINING_INTERVAL)
+
+            training_queue.task_done()
+
+        except Exception as e:
+            log.warning(f"[TRAINER] training error: {e}")
+
+
+if TRAINING_ENABLED:
+    _trainer_thread = threading.Thread(
+        target=_training_loop,
+        daemon=True,
+        name="dqn-trainer"
+    )
+    _trainer_thread.start()
+else:
+    log.info("[TRAINER] Training disabled")
+
 # Start simulation daemon
 if SIM_ENABLED:
     _sim_thread = threading.Thread(target=_simulation_loop, daemon=True, name="sim-loop")
@@ -478,19 +540,27 @@ def feedback():
     )
 
     next_payload = {
-    "cpu_util": payload.get("cpu_util", []),
-    "active_conns": payload.get("active_conns", []),
-    "avg_latency_ms": payload.get("avg_latency_ms", [])
-}
+        "cpu_util": payload.get("cpu_util", []),
+        "active_conns": payload.get("active_conns", []),
+        "avg_latency_ms": payload.get("avg_latency_ms", [])
+    }
 
     next_state = build_state(next_payload)
 
-    agent.store_and_train(
+    transition = (
         prev_state,
         prev_action,
         reward,
         next_state
     )
+
+    if TRAINING_ENABLED:
+        try:
+            training_queue.put_nowait(transition)
+        except Exception:
+            log.warning(
+                "[TRAINER] Training queue full; transition dropped"
+            )
 
     return jsonify({
         "status": "ok",
@@ -507,6 +577,8 @@ def status():
         "avg_reward":  round(agent.avg_recent_reward(), 4),
         "last_loss":   round(agent.last_loss, 6),
         "sim_enabled": SIM_ENABLED,
+        "training_enabled": TRAINING_ENABLED,
+        "training_queue": training_queue.qsize(),
     })
 
 

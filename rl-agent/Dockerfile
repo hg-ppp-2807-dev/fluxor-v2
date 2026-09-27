@@ -6,4 +6,4 @@ RUN pip install --upgrade pip && pip install --no-cache-dir --default-timeout=30
 COPY app.py .
 RUN mkdir -p /app/checkpoints
 EXPOSE 5000
-CMD ["python", "app.py"]
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--threads", "32", "--timeout", "30", "app:app"]

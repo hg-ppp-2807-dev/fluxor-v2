@@ -69,15 +69,24 @@ func (s *Server) GetCPU() float64 {
 
 // ─── Load Balancer ────────────────────────────────────────────────────────────
 
+type FeedbackJob struct {
+	ServerID  int
+	LatencyMs float64
+	RequestID string
+	States    []ServerState
+}
+
 type LoadBalancer struct {
-	servers    []*Server
-	rrCounter  uint64
-	algorithm  string
-	algMu      sync.RWMutex
-	rlAgentURL string
-	hub        *Hub
-	reqCount   int64 // NEW
-	currentRPS int64 // NEW
+	servers       []*Server
+	rrCounter     uint64
+	algorithm     string
+	algMu         sync.RWMutex
+	rlAgentURL    string
+	rlClient      *http.Client
+	hub           *Hub
+	reqCount      int64
+	currentRPS    int64
+	feedbackQueue chan FeedbackJob
 }
 
 func NewLoadBalancer(backendURLs []string, rlAgentURL string, hub *Hub) *LoadBalancer {
@@ -93,7 +102,35 @@ func NewLoadBalancer(backendURLs []string, rlAgentURL string, hub *Hub) *LoadBal
 		servers:    servers,
 		algorithm:  os.Getenv("ALGORITHM"),
 		rlAgentURL: rlAgentURL,
-		hub:        hub,
+		rlClient: &http.Client{
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 100,
+				MaxConnsPerHost:     100,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		},
+		hub:           hub,
+		feedbackQueue: make(chan FeedbackJob, 10000),
+	}
+}
+
+func (lb *LoadBalancer) startFeedbackWorkers() {
+	const workerCount = 32
+
+	for i := 0; i < workerCount; i++ {
+		go func(workerID int) {
+			log.Printf("[RL FEEDBACK] worker %d started", workerID)
+
+			for job := range lb.feedbackQueue {
+				sendRLFeedback(
+					job.ServerID,
+					job.LatencyMs,
+					job.RequestID,
+					job.States,
+				)
+			}
+		}(i)
 	}
 }
 
@@ -167,6 +204,7 @@ type RLDecision struct {
 }
 
 func (lb *LoadBalancer) rlDecide() RLDecision {
+	rlStart := time.Now()
 	requestID := fmt.Sprintf("%d", time.Now().UnixNano())
 	healthy := lb.healthyServers()
 	if len(healthy) == 0 {
@@ -195,8 +233,8 @@ func (lb *LoadBalancer) rlDecide() RLDecision {
 
 	req, _ := http.NewRequestWithContext(ctx, "POST", lb.rlAgentURL+"/decide", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	resp, err := lb.rlClient.Do(req)
 
-	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		log.Printf("[LB] RL agent timeout, falling back to RR: %v", err)
 		return RLDecision{
@@ -211,6 +249,9 @@ func (lb *LoadBalancer) rlDecide() RLDecision {
 			Server: lb.roundRobin(),
 		}
 	}
+
+	log.Printf("[RL TIMING] total_ms=%.3f",
+		float64(time.Since(rlStart).Microseconds())/1000.0)
 
 	// Map action to actual server (must be healthy)
 	action := rlResp.Action
@@ -521,9 +562,16 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "backend error", http.StatusBadGateway)
 	}
 
+	proxyStart := time.Now()
 	proxy.ServeHTTP(w, r)
+	proxyDuration := time.Since(proxyStart)
 
 	latency := float64(time.Since(start).Milliseconds())
+
+	log.Printf("[PROXY TIMING] server=%d proxy_ms=%.3f total_ms=%.3f",
+		server.ID,
+		float64(proxyDuration.Microseconds())/1000.0,
+		float64(time.Since(start).Microseconds())/1000.0)
 	server.DecrConn()
 	server.RecordLatency(latency)
 	atomic.AddInt64(&server.TotalReqs, 1)
@@ -545,8 +593,20 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Send feedback to RL agent (non-blocking)
+	// Queue feedback for the RL worker pool without blocking the request path.
 	if algo == "rl" {
-		go sendRLFeedback(server.ID, latency, reqID, states)
+		job := FeedbackJob{
+			ServerID:  server.ID,
+			LatencyMs: latency,
+			RequestID: reqID,
+			States:    states,
+		}
+
+		select {
+		case lb.feedbackQueue <- job:
+		default:
+			log.Printf("[RL FEEDBACK] queue full, dropping feedback request_id=%s", reqID)
+		}
 	}
 
 	// New-style WS broadcast
@@ -589,14 +649,14 @@ func sendRLFeedback(
 	requestRate := float64(atomic.LoadInt64(&lb.currentRPS))
 
 	body, _ := json.Marshal(map[string]interface{}{
-		"server_id":  serverID,
-		"latency_ms": latencyMs,
-		"request_id": requestID,
-		"cpu_util":   cpuUtil,
-		//"active_conns":   activeConns,
+		"server_id":      serverID,
+		"latency_ms":     latencyMs,
+		"request_id":     requestID,
+		"cpu_util":       cpuUtil,
+		"active_conns":   activeConns,
 		"avg_latency_ms": avgLatency,
 		"request_rate":   requestRate,
-		//"queue_depth":    queueDepth,
+		"queue_depth":    queueDepth,
 	})
 
 	ctx, cancel := context.WithTimeout(
@@ -619,13 +679,30 @@ func sendRLFeedback(
 
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	feedbackStart := time.Now()
+
+	resp, err := lb.rlClient.Do(req)
+	feedbackDuration := time.Since(feedbackStart)
+
 	if err != nil {
-		log.Printf("[LB] feedback failed: %v", err)
+		log.Printf(
+			"[LB] feedback failed: duration_ms=%.3f err=%v request_id=%s",
+			float64(feedbackDuration.Microseconds())/1000.0,
+			err,
+			requestID,
+		)
 		return
 	}
 
 	resp.Body.Close()
+
+	if feedbackDuration > 50*time.Millisecond {
+		log.Printf(
+			"[LB] slow feedback: duration_ms=%.3f request_id=%s",
+			float64(feedbackDuration.Microseconds())/1000.0,
+			requestID,
+		)
+	}
 }
 
 // ─── Health Checker ───────────────────────────────────────────────────────────
@@ -671,6 +748,7 @@ func main() {
 	go hub.Run()
 
 	lb = NewLoadBalancer(backendURLs, rlAgentURL, hub)
+	lb.startFeedbackWorkers()
 
 	// NEW: reset reqCount into currentRPS every second
 	go func() {
