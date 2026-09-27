@@ -1,0 +1,164 @@
+version: "3.9"
+
+networks:
+  lb-net:
+    driver: bridge
+
+services:
+  # ── Backend Servers ───────────────────────────────────────────
+  backend-1:
+    build: ./backend
+    container_name: backend-1
+    environment:
+      - SERVER_ID=1
+      - PORT=8081
+    ports:
+      - "8081:8081"
+    networks:
+      - lb-net
+    healthcheck:
+      test: [ "CMD", "wget", "-qO-", "http://localhost:8081/health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  backend-2:
+    build: ./backend
+    container_name: backend-2
+    environment:
+      - SERVER_ID=2
+      - PORT=8082
+    ports:
+      - "8082:8082"
+    networks:
+      - lb-net
+    healthcheck:
+      test: [ "CMD", "wget", "-qO-", "http://localhost:8082/health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  backend-3:
+    build: ./backend
+    container_name: backend-3
+    environment:
+      - SERVER_ID=3
+      - PORT=8083
+    ports:
+      - "8083:8083"
+    networks:
+      - lb-net
+    healthcheck:
+      test: [ "CMD", "wget", "-qO-", "http://localhost:8083/health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── RL Agent ──────────────────────────────────────────────────
+  rl-agent:
+    build: ./rl-agent
+    container_name: rl-agent
+    ports:
+      - "5005:5000"
+    environment:
+      - PROMETHEUS_URL=http://prometheus:9090
+      - N_SERVERS=3
+      - PORT=5000
+      - SIM_ENABLED=false
+      - SIM_INTERVAL_S=0.1
+    networks:
+      - lb-net
+    depends_on:
+      - prometheus
+    volumes:
+      - ./rl-agent/checkpoints:/app/checkpoints
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:5000/health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── Load Balancer ─────────────────────────────────────────────
+  load-balancer:
+    build: ./load-balancer
+    container_name: load-balancer
+    ports:
+      - "8080:8080"
+    environment:
+      - BACKEND_URLS=http://backend-1:8081,http://backend-2:8082,http://backend-3:8083
+      - RL_AGENT_URL=http://rl-agent:5000
+      - ALGORITHM=lc
+    networks:
+      - lb-net
+    depends_on:
+      backend-1:
+        condition: service_started
+      backend-2:
+        condition: service_started
+      backend-3:
+        condition: service_started
+      rl-agent:
+        condition: service_healthy
+
+  # ── Monitoring ────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - lb-net
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=1d"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards
+    networks:
+      - lb-net
+    depends_on:
+      - prometheus
+
+  # ── React Dashboard ───────────────────────────────────────────
+  dashboard:
+    build:
+      context: ./dashboard
+      args:
+        - VITE_WS_URL=ws://localhost:8080/ws
+        - VITE_LB_URL=http://localhost:8080
+        - VITE_RL_URL=http://localhost:5005
+    container_name: dashboard
+    ports:
+      - "3000:3000"
+    networks:
+      - lb-net
+    depends_on:
+      - load-balancer
+
+  # ── Traffic Generator (sends requests so dashboard has live data) ──
+  traffic-gen:
+    image: alpine:3.19
+    container_name: traffic-gen
+    entrypoint: [ "/bin/sh", "/scripts/traffic-gen.sh" ]
+    environment:
+      - LB_URL=http://load-balancer:8080
+      - RPS=5
+    volumes:
+      - ./scripts:/scripts:ro
+    networks:
+      - lb-net
+    depends_on:
+      - load-balancer
+    restart: unless-stopped
