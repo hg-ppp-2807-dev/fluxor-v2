@@ -20,11 +20,14 @@ import random
 import logging
 import threading
 import math
+import atexit
 from collections import deque
 from queue import Queue
 
 import numpy as np
 import torch
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
 import torch.nn as nn
 import torch.optim as optim
 import requests
@@ -57,6 +60,48 @@ os.makedirs(CKPT_DIR, exist_ok=True)
 pending_decisions = {}
 pending_decisions_lock = threading.Lock()
 training_queue = Queue(maxsize=TRAINING_QUEUE_SIZE)
+
+# ── Background Checkpoint Saving ──────────────────────────────
+_pending_checkpoint = None
+_checkpoint_lock = threading.Lock()
+_checkpoint_event = threading.Event()
+_checkpoint_stop_event = threading.Event()
+
+def enqueue_checkpoint(snapshot: dict):
+    global _pending_checkpoint
+    step = snapshot.get("step_count", 0)
+    log.info(f"[CHECKPOINT] requested step={step}")
+    with _checkpoint_lock:
+        _pending_checkpoint = snapshot
+        _checkpoint_event.set()
+
+def _checkpoint_worker():
+    global _pending_checkpoint
+    log.info("[CHECKPOINT] Background checkpoint worker started")
+    while not _checkpoint_stop_event.is_set() or _pending_checkpoint is not None:
+        _checkpoint_event.wait(timeout=0.5)
+        _checkpoint_event.clear()
+
+        snapshot = None
+        with _checkpoint_lock:
+            if _pending_checkpoint is not None:
+                snapshot = _pending_checkpoint
+                _pending_checkpoint = None
+
+        if snapshot is None:
+            if _checkpoint_stop_event.is_set():
+                break
+            continue
+
+        step = snapshot.get("step_count", 0)
+        log.info(f"[CHECKPOINT] save started step={step}")
+        try:
+            tmp_path = f"{CKPT_PATH}.tmp"
+            torch.save(snapshot, tmp_path)
+            os.replace(tmp_path, CKPT_PATH)
+            log.info(f"[CHECKPOINT] save completed step={step}")
+        except Exception as e:
+            log.error(f"[CHECKPOINT] save failed step={step} error={e}")
 
 
 # ── DQN Model ─────────────────────────────────────────────────
@@ -210,12 +255,14 @@ class DQNAgent:
         self.train_step()
 
     def save_checkpoint(self):
-        torch.save({
-            "policy":     self.policy_net.state_dict(),
-            "target":     self.target_net.state_dict(),
-            "epsilon":    self.epsilon,
-            "step_count": self.step_count,
-        }, CKPT_PATH)
+        """Asynchronously requests a checkpoint save by snapshotting state under lock."""
+        snapshot = {
+            "policy": {k: v.cpu().clone() for k, v in self.policy_net.state_dict().items()},
+            "target": {k: v.cpu().clone() for k, v in self.target_net.state_dict().items()},
+            "epsilon": float(self.epsilon),
+            "step_count": int(self.step_count),
+        }
+        enqueue_checkpoint(snapshot)
 
     def load_checkpoint(self):
         if os.path.exists(CKPT_PATH):
@@ -440,6 +487,22 @@ if SIM_ENABLED:
     log.info("Synthetic simulation ENABLED")
 else:
     log.info("Synthetic simulation DISABLED (set SIM_ENABLED=true to enable)")
+
+# Start checkpoint background worker
+_checkpoint_thread = threading.Thread(
+    target=_checkpoint_worker,
+    daemon=True,
+    name="ckpt-worker"
+)
+_checkpoint_thread.start()
+
+def _shutdown_checkpoint_worker():
+    _checkpoint_stop_event.set()
+    _checkpoint_event.set()
+    if "_checkpoint_thread" in globals() and _checkpoint_thread.is_alive():
+        _checkpoint_thread.join(timeout=3.0)
+
+atexit.register(_shutdown_checkpoint_worker)
 
 
 # ── Flask routes ──────────────────────────────────────────────

@@ -52,7 +52,12 @@ export const failureOptions = {
 }
 
 // Default export — change options to switch scenario
-export const options = spikeOptions
+const scenario = __ENV.SCENARIO || "spike"
+
+export const options =
+  scenario === "normal" ? normalOptions :
+  scenario === "failure" ? failureOptions :
+  spikeOptions
 
 export default function () {
   const res = http.get(`${LB}/work`, { timeout: '5s' })

@@ -24,6 +24,7 @@ import (
 
 type Server struct {
 	URL          *url.URL
+	Proxy        *httputil.ReverseProxy
 	ID           int
 	ActiveConns  int64
 	Healthy      int32 // 1=healthy, 0=down
@@ -96,7 +97,12 @@ func NewLoadBalancer(backendURLs []string, rlAgentURL string, hub *Hub) *LoadBal
 		if err != nil {
 			log.Fatalf("invalid backend URL %s: %v", rawURL, err)
 		}
-		servers[i] = &Server{URL: u, ID: i, Healthy: 1}
+		proxy := httputil.NewSingleHostReverseProxy(u)
+                proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+                        log.Printf("[PROXY] error to %s: %v", u, err)
+                        http.Error(w, "backend error", http.StatusBadGateway)
+                }
+                servers[i] = &Server{URL: u, Proxy: proxy, ID: i, Healthy: 1}
 	}
 	return &LoadBalancer{
 		servers:    servers,
@@ -556,11 +562,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		reqID = rlRequestID
 	}
 
-	proxy := httputil.NewSingleHostReverseProxy(server.URL)
-	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Printf("[PROXY] error to %s: %v", server.URL, err)
-		http.Error(w, "backend error", http.StatusBadGateway)
-	}
+	proxy := server.Proxy
 
 	proxyStart := time.Now()
 	proxy.ServeHTTP(w, r)
