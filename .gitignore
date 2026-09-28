@@ -30,6 +30,7 @@ coverage/
 
 # Logs
 *.log
+!scripts/results/cpu-logs/**/*.log
 
 # Go compiled binaries
 load-balancer/load-balancer

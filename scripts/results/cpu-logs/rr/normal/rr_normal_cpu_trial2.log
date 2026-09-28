@@ -1,0 +1,33 @@
+[MONITOR] Backend CPU monitor started.
+[MONITOR] Sampling backend-1, backend-2, backend-3 every 1 second.
+[MONITOR] Press Ctrl+C to stop and save results.
+[CPU] B1= 11.92% B2= 12.34% B3= 10.91% STD=  0.60%
+[CPU] B1=  9.58% B2= 13.65% B3=  9.84% STD=  1.86%
+[CPU] B1= 10.69% B2= 12.71% B3=  8.40% STD=  1.76%
+[CPU] B1= 11.12% B2= 12.47% B3= 11.32% STD=  0.59%
+[CPU] B1=  9.56% B2= 13.29% B3=  9.79% STD=  1.71%
+[CPU] B1= 10.95% B2= 12.27% B3=  9.12% STD=  1.29%
+[CPU] B1= 12.13% B2= 11.67% B3= 11.03% STD=  0.45%
+[CPU] B1= 12.63% B2= 12.29% B3= 11.78% STD=  0.35%
+[CPU] B1= 10.18% B2= 10.33% B3= 11.07% STD=  0.39%
+[CPU] B1=  6.57% B2=  8.61% B3=  6.22% STD=  1.05%
+[CPU] B1= 12.12% B2= 11.28% B3= 11.73% STD=  0.34%
+[CPU] B1= 11.44% B2= 10.99% B3=  9.73% STD=  0.72%
+[CPU] B1= 13.97% B2=  8.89% B3= 11.65% STD=  2.08%
+[CPU] B1= 10.77% B2= 12.70% B3= 10.38% STD=  1.01%
+[CPU] B1= 11.59% B2= 11.59% B3= 10.52% STD=  0.50%
+[CPU] B1=  7.89% B2=  8.84% B3= 11.34% STD=  1.46%
+[CPU] B1= 11.25% B2= 11.79% B3= 10.87% STD=  0.38%
+[CPU] B1= 12.03% B2= 12.37% B3= 10.66% STD=  0.74%
+[CPU] B1= 13.28% B2= 11.85% B3= 11.01% STD=  0.94%
+[CPU] B1=  7.94% B2=  9.17% B3= 11.36% STD=  1.41%
+
+============================================================
+BACKEND CPU MONITOR SUMMARY
+============================================================
+Samples:             20
+Average CPU:         10.92%
+Average CPU STDDEV:  0.98%
+Peak CPU STDDEV:     2.08%
+Saved:               scripts/results/cpu/backend_cpu_20260928_081226.csv
+============================================================
